@@ -40,6 +40,9 @@ def main() -> None:
             if data is None:
                 print("Connection closed by server.")
                 break
+            if data == "No room in lobby":
+                print("No room in the lobby")
+                break
             print(f"Received: {data}")
             user_input = input("Your input: ")
             send_message(s, user_input)

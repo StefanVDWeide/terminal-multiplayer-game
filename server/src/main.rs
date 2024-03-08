@@ -48,10 +48,11 @@ impl Shared {
 impl Peer {
     async fn new(
         state: Arc<Mutex<Shared>>,
-        lines: Framed<TcpStream, LinesCodec>,
+        mut lines: Framed<TcpStream, LinesCodec>,
         room_name: String,
     ) -> io::Result<Option<Peer>> {
-        let addr = lines.get_ref().peer_addr()?;
+        let lines_ref = lines.get_ref();
+        let addr = lines_ref.peer_addr()?;
         let (tx, rx) = mpsc::unbounded_channel();
 
         let mut state = state.lock().await;
@@ -63,6 +64,7 @@ impl Peer {
 
         // Prevent joining if the room already has 2 players
         if peers.len() >= 3 {
+            let _ = lines.send("No room in lobby").await;
             println!("No room in lobby");
             return Ok(None);
         }
@@ -148,7 +150,7 @@ async fn process(
                 state.broadcast(&peer.room, addr, &msg).await;
             }
         }
-        // TODO: Ensure that we return a message back when it's full
+        // Disconnect TCP connection. A message has already been sent at that the lobby is full at this point
         None => {}
     }
 
