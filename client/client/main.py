@@ -1,4 +1,5 @@
 import socket
+from game.game import GameClient
 
 HOST = "127.0.0.1"
 PORT = 8080
@@ -34,18 +35,28 @@ def main() -> None:
         print(receive_message(s))  # "Please enter your username:"
         username = input()
         send_message(s, username)
+        data = receive_message(s)
+
+        if data is None:
+            print("Connection closed by server.")
+            return
+
+        if data == "No room in lobby":
+            print("No room in the lobby")
+            return
+
+        print(data)
+        game = GameClient()
 
         while True:
+            user_input = input("With how many point do you want to attack?: ")
+            payload = str({"attack": user_input})
+            send_message(s, payload)
             data = receive_message(s)
             if data is None:
                 print("Connection closed by server.")
                 break
-            if data == "No room in lobby":
-                print("No room in the lobby")
-                break
             print(f"Received: {data}")
-            user_input = input("Your input: ")
-            send_message(s, user_input)
 
 
 if __name__ == "__main__":
