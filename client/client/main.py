@@ -1,4 +1,5 @@
 import socket
+import json
 from game.game import GameClient
 
 HOST = "127.0.0.1"
@@ -46,11 +47,21 @@ def main() -> None:
             return
 
         print(data)
+        # TODO: Come up with better logic here
         game = GameClient()
 
         while True:
-            user_input = input("With how many point do you want to attack?: ")
-            payload = str({"attack": user_input})
+            user_input = input("With how many points do you want to attack?: ")
+            try:
+                attack_points = int(user_input)  # Ensure that user_input is an integer
+            except ValueError:
+                print("Please enter a valid integer.")
+                continue  # Ask for input again if it's not a valid integer
+
+            payload = json.dumps(
+                {"attack": attack_points}
+                # TODO: Maybe come up with a better communication protocol?
+            )  # Serialize the payload to JSON
             send_message(s, payload)
             data = receive_message(s)
             if data is None:

@@ -4,12 +4,14 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use futures::SinkExt;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Shorthand for the transmit half of the message channel.
 type Tx = mpsc::UnboundedSender<String>;
@@ -18,13 +20,25 @@ type Tx = mpsc::UnboundedSender<String>;
 type Rx = mpsc::UnboundedReceiver<String>;
 
 struct Shared {
-    rooms: HashMap<String, HashMap<SocketAddr, Tx>>,
+    rooms: HashMap<String, RoomState>,
+}
+
+struct Player {
+    name: String,
+    sender: Tx,
+    hp: i32,
+    defense: i32,
+}
+
+struct RoomState {
+    peers: HashMap<Uuid, Player>,
+    turn: Option<Uuid>, // Track whose turn it is
 }
 
 struct Peer {
     lines: Framed<TcpStream, LinesCodec>,
     rx: Rx,
-    room: String, // Track which room this peer belongs to.
+    room: String,
 }
 
 impl Shared {
@@ -34,14 +48,43 @@ impl Shared {
         }
     }
 
-    async fn broadcast(&mut self, room: &str, sender: SocketAddr, message: &str) {
-        if let Some(peers) = self.rooms.get_mut(room) {
-            for (&addr, tx) in peers {
-                if addr != sender {
-                    let _ = tx.send(message.into());
+    async fn broadcast(&self, room: &str, user_id: Uuid, message: &str) {
+        if let Some(room_state) = self.rooms.get(room) {
+            for (&id, player) in &room_state.peers {
+                if id != user_id {
+                    let _ = player.sender.send(message.into());
                 }
             }
         }
+    }
+
+    async fn next_turn(&mut self, room: &str) {
+        if let Some(room_state) = self.rooms.get_mut(room) {
+            let peers: Vec<Uuid> = room_state.peers.keys().copied().collect();
+            room_state.turn = match &room_state.turn {
+                Some(current) => {
+                    let index = peers.iter().position(|&addr| addr == *current).unwrap();
+                    let next_index = (index + 1) % peers.len();
+                    Some(peers[next_index])
+                }
+                None => peers.get(0).copied(),
+            };
+        }
+    }
+
+    // TODO: This is not used correctly, the player ID is the one attacking so the other should be used for applying damage
+    async fn apply_attack(&mut self, room: &str, id: Uuid, damage: i32) -> Option<String> {
+        println!("{}", id);
+        if let Some(room_state) = self.rooms.get_mut(room) {
+            if let Some(player) = room_state.peers.get_mut(&id) {
+                let total_damage = player.defense - damage;
+                player.hp -= total_damage;
+                if player.hp <= 0 {
+                    return Some(format!("{} has lost!", player.name));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -50,24 +93,40 @@ impl Peer {
         state: Arc<Mutex<Shared>>,
         mut lines: Framed<TcpStream, LinesCodec>,
         room_name: String,
+        user_name: String,
+        id: Uuid,
     ) -> io::Result<Option<Peer>> {
-        let lines_ref = lines.get_ref();
-        let addr = lines_ref.peer_addr()?;
         let (tx, rx) = mpsc::unbounded_channel();
 
         let mut state = state.lock().await;
-        let peers = state
+        let room_state = state
             .rooms
             .entry(room_name.clone())
-            .or_insert_with(HashMap::new);
-        peers.insert(addr, tx);
+            .or_insert_with(|| RoomState {
+                peers: HashMap::new(),
+                turn: None,
+            });
 
-        // Prevent joining if the room already has 2 players
-        if peers.len() >= 3 {
+        // Check if there are 2 or more people in the room already and prevent the next person from joining
+        if room_state.peers.len() >= 2 {
             let _ = lines.send("No room in lobby").await;
             println!("No room in lobby");
             return Ok(None);
         }
+
+        let player_struct = Player {
+            name: user_name,
+            sender: tx,
+            hp: 10,
+            defense: 10,
+        };
+
+        // Create the player data -> Refactor this. Probably use a UUID instead of the addr
+        room_state.peers.insert(id, player_struct);
+        if room_state.peers.len() == 2 {
+            room_state.turn = Some(id); // First player to join attacks first
+        }
+
         Ok(Some(Peer {
             lines,
             rx,
@@ -83,11 +142,12 @@ async fn process(
 ) -> Result<(), Box<dyn Error>> {
     let mut lines = Framed::new(stream, LinesCodec::new());
 
+    // Ask the user for the room name that they want to join
     lines.send("Please enter your room name:").await?;
     let room_name = match lines.next().await {
         Some(Ok(line)) => line,
         _ => {
-            tracing::error!(
+            eprintln!(
                 "Failed to get room name from {}. Client disconnected.",
                 addr
             );
@@ -95,63 +155,63 @@ async fn process(
         }
     };
 
+    // Ask the user for their username
     lines.send("Please enter your username:").await?;
-    let username = match lines.next().await {
-        Some(Ok(line)) => line,
+    let user_name = match lines.next().await {
+        Some(Ok(user_name)) => user_name,
         _ => {
-            tracing::error!("Failed to get username from {}. Client disconnected.", addr);
+            eprintln!("Failed to get username from {}. Client disconnected.", addr);
             return Ok(());
         }
     };
 
-    let peer = Peer::new(state.clone(), lines, room_name.clone()).await?;
-    match peer {
-        Some(mut peer) => {
-            println!("Room found in lobby");
-            {
-                let mut state = state.lock().await;
-                let msg = format!("{} has joined the room {}", username, room_name);
-                tracing::info!("{}", msg);
-                state.broadcast(&room_name, addr, &msg).await;
-            }
+    // Generate an unique ID for each player
+    let id = Uuid::new_v4();
 
-            loop {
-                tokio::select! {
-                    Some(msg) = peer.rx.recv() => {
-                        peer.lines.send(&msg).await?;
-                    }
-                    result = peer.lines.next() => match result {
-                        Some(Ok(msg)) => {
-                            let mut state = state.lock().await;
-                            let msg = format!("{}: {}", username, msg);
+    println!("{}", id);
 
-                            state.broadcast(&peer.room, addr, &msg).await;
-                        }
-                        Some(Err(e)) => {
-                            tracing::error!(
-                                "an error occurred while processing messages for {}; error = {:?}",
-                                username,
-                                e
-                            );
-                        }
-                        None => break,
-                    },
-                }
-            }
-
-            {
-                let mut state = state.lock().await;
-                if let Some(peers) = state.rooms.get_mut(&peer.room) {
-                    peers.remove(&addr);
-                }
-
-                let msg = format!("{} has left the room {}", username, peer.room);
-                tracing::info!("{}", msg);
-                state.broadcast(&peer.room, addr, &msg).await;
+    let peer = Peer::new(state.clone(), lines, room_name.clone(), user_name, id).await?;
+    if let Some(mut peer) = peer {
+        let mut state_lock = state.lock().await;
+        let room_state = state_lock.rooms.get_mut(&room_name).unwrap();
+        if let Some(turn) = room_state.turn {
+            if turn == id {
+                let msg = "Your turn";
+                peer.lines.send(msg).await?;
             }
         }
-        // Disconnect TCP connection. A message has already been sent at that the lobby is full at this point
-        None => {}
+        drop(state_lock); // Release lock immediately after use
+
+        loop {
+            tokio::select! {
+                Some(msg) = peer.rx.recv() => {
+                    peer.lines.send(&msg).await?;
+                }
+                result = peer.lines.next() => match result {
+                    Some(Ok(msg)) => {
+                        let mut state = state.lock().await;
+                        println!("{}", &msg);
+                        if msg.contains("attack") {
+                            let value: Value = serde_json::from_str(&msg).unwrap();
+                            println!("{:?}", value);
+                            if let Some(attack_value) = value.get("attack").and_then(|v| v.as_i64()).map(|v| v as i32) {
+                                // TODO: Make this more clear for the players. What should be sent back when an attack has been done?
+                                if let Some(result_message) = state.apply_attack(&peer.room, id, attack_value).await {
+                                    state.broadcast(&peer.room, id, &result_message).await;
+                                    break;
+                                }
+                                state.next_turn(&peer.room).await;
+                                state.broadcast(&peer.room, id, "next turn").await;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("an error occurred while processing messages for {}; error = {:?}", addr, e);
+                    }
+                    None => break,
+                },
+            }
+        }
     }
 
     Ok(())
