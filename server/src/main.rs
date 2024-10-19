@@ -67,20 +67,33 @@ impl Shared {
                     let next_index = (index + 1) % peers.len();
                     Some(peers[next_index])
                 }
-                None => peers.get(0).copied(),
+                None => peers.first().copied(),
             };
         }
     }
 
-    // TODO: This is not used correctly, the player ID is the one attacking so the other should be used for applying damage
-    async fn apply_attack(&mut self, room: &str, id: Uuid, damage: i32) -> Option<String> {
-        println!("{}", id);
+    async fn apply_attack(&mut self, room: &str, attacker_id: Uuid, damage: i32) -> Option<String> {
         if let Some(room_state) = self.rooms.get_mut(room) {
-            if let Some(player) = room_state.peers.get_mut(&id) {
-                let total_damage = player.defense - damage;
-                player.hp -= total_damage;
-                if player.hp <= 0 {
-                    return Some(format!("{} has lost!", player.name));
+            // Find the opponent.
+            let opponent_id = room_state
+                .peers
+                .keys()
+                .find(|&&uid| uid != attacker_id)
+                .copied();
+            if let Some(opponent_id) = opponent_id {
+                if let Some(opponent) = room_state.peers.get_mut(&opponent_id) {
+                    // Calculate damage, ensuring it's not negative.
+                    let total_damage = damage.saturating_sub(opponent.defense);
+                    opponent.hp -= total_damage;
+
+                    println!(
+                        "Player {} attacked {} for {} damage",
+                        attacker_id, opponent_id, total_damage
+                    );
+
+                    if opponent.hp <= 0 {
+                        return Some(format!("{} has lost!", opponent.name));
+                    }
                 }
             }
         }
